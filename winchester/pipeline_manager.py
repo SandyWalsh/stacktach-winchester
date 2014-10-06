@@ -55,11 +55,12 @@ class Pipeline(object):
                 handler = handler_class(**params)
             except Exception as e:
                 logger.exception("Error initalizing handler %s for pipeline %s" %
-                                 handler_class, self.name)
+                                 (handler_class, self.name))
                 raise PipelineExecutionError("Error loading pipeline", e)
             self.handlers.append(handler)
 
-    def handle_events(self, events, debugger):
+    def handle_events(self, events, stream, debugger):
+        self.env['stream_id'] = stream.id
         event_ids = set(e['message_id'] for e in events)
         try:
             for handler in self.handlers:
@@ -213,7 +214,7 @@ class PipelineManager(object):
         debugger = trigger_def.debugger
         try:
             pipeline = Pipeline(pipeline_name, pipeline_config, self.pipeline_handlers)
-            new_events = pipeline.handle_events(events, debugger)
+            new_events = pipeline.handle_events(events, stream, debugger)
         except PipelineExecutionError:
             logger.error("Exception in pipeline %s handling stream %s" % (
                           pipeline_name, stream.id))

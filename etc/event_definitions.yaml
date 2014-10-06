@@ -2,11 +2,19 @@
 - event_type: compute.instance.*
   traits: &instance_traits
     tenant_id:
-      fields: payload.tenant_id
+      fields: 
+        - payload.tenant_id 
+        - _context_project_id
     user_id:
       fields: payload.user_id
+    request_id: _context_request_id
+    message: payload.message
     instance_id:
-      fields: payload.instance_id
+      fields: 
+        - payload.instance_uuid
+        - payload.instance_id
+        - exception.kwargs.uuid
+        - instance.uuid
     host:
       fields: publisher_id
       plugin:
@@ -17,6 +25,10 @@
     service:
       fields: publisher_id
       plugin: split
+    flavor_id:
+      fields: 
+        - payload.instance_flavor_id 
+        - payload.image_meta.instance_type_flavor_id
     memory_mb:
       type: int
       fields: payload.memory_mb
@@ -45,12 +57,16 @@
       fields: payload.image_meta.'org.openstack__1__os_version'
     os_distro:
       fields: payload.image_meta.'org.openstack__1__os_distro'
+    rax_options:
+      fields: payload.image_meta.'com.rackspace__1__options'
     launched_at:
       type: datetime
       fields: payload.launched_at
     deleted_at:
       type: datetime
-      fields: payload.deleted_at
+      fields: 
+        - payload.deleted_at 
+        - payload.terminated_at
 - event_type: compute.instance.exists
   traits:
     <<: *instance_traits
