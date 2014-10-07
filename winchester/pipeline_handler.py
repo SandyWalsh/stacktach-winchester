@@ -1,10 +1,21 @@
 import abc
 import datetime
 import logging
+import json  # TEMP
 import six
 import uuid
 
 logger = logging.getLogger(__name__)
+
+class DateTimeEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, datetime.datetime):
+            encoded_object = list(obj.timetuple())[0:7]
+        elif isinstance(obj, datetime.timedelta):
+            encoded_object = (obj.days, obj.seconds, obj.microseconds)
+        else:
+            encoded_object = json.JSONEncoder.default(self, obj)
+        return encoded_object
 
 
 @six.add_metaclass(abc.ABCMeta)
@@ -98,25 +109,37 @@ class UsageException(Exception):
 class UsageHandler(PipelineHandlerBase):
     def _find_exists(self, events):
         exists = None
+
+        # We could have several .exists records, but only the
+        # end-of-day .exists will have audit_period_* time of
+        # 00:00:00 and be 24hrs apart.
         for event in events:
-            if event['event_type'] == 'compute.instance.exists':
+            apb = event.get('audit_period_beginning')
+            ape = event.get('audit_period_ending')
+            if (event['event_type'] == 'compute.instance.exists'
+                and apb and ape and apb.time() == datetime.time(0, 0, 0)
+                and ape.time() == datetime.time(0, 0, 0)
+                and ape.date() == (apb.date() + datetime.timedelta(days=1))):
                 exists = event
+                self.audit_beginning = apb
+                self.audit_ending = ape
                 break
 
         if not exists:
-            raise UsageException("Stream ID %s has no .exists record" %
-                                    self.stream_id)
+            raise UsageException("No .exists record.")
 
         return exists
 
     def _extract_launched_at(self, exists):
         if not exists['launched_at']:
-            raise UsageException(".exists record for Stream ID %s as "
-                                 "no launched_at value."
-                                  % self.stream_id)
+            raise UsageException(".exists has no launched_at value.")
         return exists['launched_at']
 
-    def _find_events_around(self, events, launched_at):
+    def _extract_interesting_events(self, events, interesting):
+        return [event for event in events
+                        if event['event_type'] in interesting]
+
+    def _find_events(self, events):
         interesting = ['compute.instance.rebuild.start',
                        'compute.instance.resize.prep.start',
                        'compute.instance.resize.revert.start',
@@ -127,100 +150,118 @@ class UsageHandler(PipelineHandlerBase):
                        'compute.instance.resize.revert.end',
                        'compute.instance.rescue.end']
 
-        subset = [event for event in events
-                        if event['event_type'] in interesting]
+        # We could easily end up with no events in final_set if
+        # there were no operations performed on an instance that day.
+        # We'll still get a .exists for every active instance though.
 
-        from_date = launched_at
-        to_date = launched_at + datetime.timedelta(seconds=1)
+        return self._extract_interesting_events(events, interesting)
 
-        final_set = [event for event in subset
-                         if event.get('launched_at') >= from_date
-                         and event.get('launched_at') <= to_date]
-
-        if not final_set:
-            raise UsageException("No events to check .exists against "
-                                 "in stream %s" % self.stream_id)
-
-        return final_set
-
-    def _find_deleted_events_around(self, events, launched_at):
+    def _find_deleted_events(self, events):
         interesting = ['compute.instance.delete.end']
+        return self._extract_interesting_events(events, interesting)
 
-        subset = [event for event in events
-                        if event['event_type'] in interesting]
-
-        from_date = launched_at
-        to_date = launched_at + datetime.timedelta(seconds=1)
-
-        final_set = [event for event in subset
-                         if event.get('launched_at') >= from_date
-                         and event.get('launched_at') <= to_date]
-
-        return final_set
-
-    def _verify_fields(exists, launch, fields):
+    def _verify_fields(self, exists, launch, fields):
         for field in fields:
+            if field not in exists and field not in launch:
+                continue
             if exists[field] != launch[field]:
                 raise UsageException("Conflicting '%s' values ('%s' != '%s')"
                                 % (field, exists[field], launch[field]))
 
-    def _confirm_delete(exists, deleted, fields):
-        if exists['deleted_at'] and not deleted:
-            raise UsageException(".exists event has deleted_at, but no "
-                                 "matching .delete event found. "
-                                 "Stream ID %s" % self.stream_id)
+    def _confirm_delete(self, exists, deleted, fields):
+        deleted_at = exists.get('deleted_at')
+        launched_at = exists.get('launched_at')
+        state = exists.get('state')
 
-        if not exists['deleted_at'] and deleted:
+        if deleted_at and state != "deleted":
+            raise UsageException(".exists state not 'deleted' but "
+                             "deleted_at is set.")
+
+        if deleted_at and not deleted:
+            # We've already confirmed it's in the "deleted" state.
+            if deleted_at < launched_at:
+                raise UsageException(".exists deleted_at < launched_at.")
+
+            # Is the deleted_at within this audit period?
+            if (deleted_at >= self.audit_beginning
+                                and deleted_at <= self.audit_ending):
+                raise UsageException(".exists deleted_at in audit "
+                    "period, but no matching .delete event found.")
+
+        if not deleted_at and deleted:
             raise UsageException(".deleted events found but .exists has "
-                                 "no deleted_at value. "
-                                 "Stream ID %s" % self.stream_id)
+                                 "no deleted_at value.")
 
-        self._verify_fields(exists, deleted[0],  fields)
+        if deleted:
+            self._verify_fields(exists, deleted[0],  fields)
 
+    def _confirm_launched_at(self, exists, events):
+        if exists.get('state') != 'active':
+            return
+
+        # Does launched_at have a value within this audit period?
+        # If so, we should have a related event. Otherwise, this
+        # instance was created previously.
+        launched_at = exists['launched_at']
+        if (launched_at >= self.audit_beginning
+                and launched_at <= self.audit_ending and len(events) == 1):
+            raise UsageException(".exists launched_at in audit "
+                "period, but no related events found.")
+
+        # TODO(sandy): Confirm the events we got set launched_at
+        # properly.
+
+    def _get_core_fields(self):
+        """Broken out so derived classes can define their
+           own trait list."""
+        return ['launched_at', 'instance_type_id', 'tenant_id',
+                'os_architecture', 'os_version', 'os_distro']
 
     def handle_events(self, events, env):
         self.env = env
         self.stream_id = env['stream_id']
-        error = None
-
-        core_fields = ['launched_at',
-                       'instance_type_id',
-                       'tenant_id',
-                       'rax_options',
-                       'os_architecture',
-                       'os_version',
-                       'os_distro']
 
         delete_fields = ['launched_at', 'deleted_at']
+        core_fields = self._get_core_fields()
 
+        exists = None
+        error = None
         try:
             exists = self._find_exists(events)
             launched_at = self._extract_launched_at(exists)
-            deleted = self._find_deleted_events_around(events, launched_at)
+            deleted = self._find_deleted_events(events)
             if len(deleted) > 1:
-                raise UsageException("Multiple .delete events for stream %s"
-                                                % self.stream_id)
-            close = self._find_events_around(events, launched_at)
-            if len(close) > 1:
-                raise UsageException("Multiple usage events for stream %s"
-                                                % self.stream_id)
+                raise UsageException("Multiple .delete.end events")
+            close = self._find_events(events)
+            for c in close:
+                self._verify_fields(exists, c, core_fields)
 
-            self._verify_fields(exists, close[0], core_fields)
-
+            self._confirm_launched_at(exists, events)
             self._confirm_delete(exists, deleted, delete_fields)
             event_type = "compute.instance.exists.verified"
         except UsageException as e:
             error = str(e)
+            logger.warn("Stream %s UsageException: %s" % (self.stream_id, e))
+            logger.warn("^ Exists: %s" % json.dumps(exists, cls=DateTimeEncoder, indent=2))
             event_type = "compute.instance.exists.failed"
-        new_event = {'event_type': event_type,
-                     'message_id': str(uuid.uuid4()),
-                     'timestamp': datetime.datetime.utcnow(),
-                     'stream_id': int(self.stream_id),
-                     'instance_id': exists.get('instance_id'),
-                     'error': error
-                    }
-        logger.debug("NEW EVENT: %s" % new_event)
-        events.append(new_event)
+
+        if len(events) > 1:
+            logger.warn("Events for Steam: %s" % self.stream_id)
+            for event in events:
+                logger.warn("^Event: %s - %s" % (event['timestamp'], event['event_type']))
+
+        if exists:
+            new_event = {'event_type': event_type,
+                         'message_id': str(uuid.uuid4()),
+                         'timestamp': exists.get('timestamp',
+                                                datetime.datetime.utcnow()),
+                         'stream_id': int(self.stream_id),
+                         'instance_id': exists.get('instance_id'),
+                         'error': error
+                        }
+            #events.append(new_event)
+        else:
+            logger.debug("No .exists record")
         return events
 
     def commit(self):
@@ -228,4 +269,3 @@ class UsageHandler(PipelineHandlerBase):
 
     def rollback(self):
         pass
-
