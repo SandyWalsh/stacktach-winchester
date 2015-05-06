@@ -292,9 +292,8 @@ class DBInterface(object):
             return self.set_stream_state(stream, models.StreamState.retry_expire)
         return stream
 
-    @sessioned
-    def find_streams(self, count=False, stream_id=None, state=None,
-                     older_than=None, younger_than=None,
+    def _build_stream_query(self, session, count=False, stream_id=None,
+                     state=None, older_than=None, younger_than=None,
                      name=None, distinguishing_traits=None,
                      session=None, include_events=False,
                      limit=None, mark=None):
@@ -332,7 +331,7 @@ class DBInterface(object):
 
         if count:
             q = q.count()
-            return [{"count": q}]
+            return q
 
         if order_desc:
             q = q.order_by(models.Stream.id.desc())
@@ -344,6 +343,22 @@ class DBInterface(object):
         if limit is not None:
             q = q.limit(limit)
 
+        return q
+
+    @sessioned
+    def find_streams(self, count=False, stream_id=None, state=None,
+                     older_than=None, younger_than=None,
+                     name=None, distinguishing_traits=None,
+                     session=None, include_events=False,
+                     limit=None, mark=None):
+
+        q = self._build_stream_query(session, count=count,
+                                 stream_id=stream_id,
+                                 state=state, older_than=older_than,
+                                 younger_than=younger_than, name=name,
+                                 distinguishing_traits=distinguishing_traits,
+                                 limit=limit, mark=mark)
+
         stream_info = []
         for stream in q.all():
             info = stream.as_dict
@@ -352,6 +367,23 @@ class DBInterface(object):
                 info['events'] = self.get_stream_events(stream, session=session)
             stream_info.append(info)
         return stream_info
+
+    @sessioned
+    def delete_streams(self, count=False, stream_id=None, state=None,
+                     older_than=None, younger_than=None,
+                     name=None, distinguishing_traits=None,
+                     session=None, include_events=False)
+
+        q = self._build_stream_query(session, count=count,
+                                 stream_id=stream_id,
+                                 state=state, older_than=older_than,
+                                 younger_than=younger_than, name=name,
+                                 distinguishing_traits=distinguishing_traits)
+        if include_events:
+            for stream in q.all():
+                stream.events.delete(synchronize_session=False)
+        q.delete(synchronize_session=False)
+        return []
 
     @sessioned
     def purge_stream(self, stream, session=None):
